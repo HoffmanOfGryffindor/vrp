@@ -1,5 +1,6 @@
 import ast
 import copy
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 from math import dist
@@ -9,13 +10,13 @@ import pandas as pd
 class VRP:
     """VRP (Vehicle Routing Problem) is a class to minimize cost in routing trucks to locations"""
 
-    def __init__(self, max_trips: int, cost_per_driver: int):
+    def __init__(self, max_trips: int, random_walks: int):
         """
         :param max_trips: max_trips is the maximum amount of trips in a single driver can take
+        :param random_walks: number of random walks to take in the cartesian space
         """
         self.max_trips = max_trips
-        self.cost = 0
-        self.cost_per_driver = cost_per_driver
+        self.random_walks = random_walks
 
     def run(self, orders: pd.DataFrame) -> list:
         """run will route trucks and minimize cost
@@ -23,9 +24,9 @@ class VRP:
         :return: list of orders for a single truck driver
         """
         self.orders = self.str_to_val(orders)
-        dist_mat = self.distance_matrix(orders)
+        self.dist_mat = self.distance_matrix(orders)
 
-        return self.minimize_cost(dist_mat=dist_mat)
+        return self.minimize_cost()
 
     def distance_matrix(self, orders: list) -> np.ndarray:
         """distance_matrix finds distances between all orders (dropoff -> pickup)
@@ -62,48 +63,59 @@ class VRP:
 
         return orders
 
-    def minimize_cost(self, dist_mat: np.ndarray) -> list:
+    def minimize_cost(self) -> list:
         """minimize_cost determines best orders to couple with the same driver
-        :param dist_mat: distance matrix for each order coupled together
         :return: list of best pairs
         """
         scores, tracks = [], []
-        for idx in range(dist_mat[0].shape[0]):
-            rand_track = [idx]
-            for _ in range(1000):
-                size = np.random.randint(1, self.max_trips)
+        p = Pool(8)
+        for idx in range(self.dist_mat[0].shape[0]):
+            scores = p.map(self.random_search, [idx for _ in range(self.random_walks)])
+        
+        track_scores, tracks = [s for s, _  in scores], [t for _, t in scores]
+        p.close(), p.join()
+        return self.find_orders(track_scores, tracks)
+    
 
-                while idx in rand_track:
-                    rand_track = np.arange(0, dist_mat[0].shape[0])
-                    np.random.shuffle(rand_track)
-                    rand_track = rand_track[:size]
+    def random_search(self, start_idx: int) -> tuple:
+        """ random_search takes random walks in the cartesian space
+        :param start_idx: idx corresponding to location
+        :return (float score, indices of track)
+        """
+        rand_track = [start_idx]
 
-                rand_track = np.append([idx], rand_track)
+        size = np.random.randint(2, self.max_trips)
 
-                score = self.total_cost(rand_track, dist_mat)
-                scores.append(score), tracks.append(rand_track)
+        while start_idx in rand_track:
+            rand_track = np.arange(0, self.dist_mat[0].shape[0])
+            np.random.shuffle(rand_track)
+            rand_track = rand_track[:size]
 
-        return self.find_orders(scores, tracks)
+        rand_track = np.append([start_idx], rand_track)
 
-    def total_cost(self, order_nums: list, dist_mat: np.ndarray) -> float:
+        score = self.total_cost(rand_track)
+        return (score, rand_track)
+
+    def total_cost(self, order_nums: list) -> float:
         """total_cost uses a paths cost per each order completed and calcuates total cost
         :param order_nums: list of loadNumbers
-        :param dist_mat: distance matrix for each order coupled together
         :return: calculates global cost for the order
         """
         first_loc, *next_locations = order_nums
-        cost = dist_mat[first_loc, first_loc]
+        cost = self.dist_mat[first_loc, first_loc]
 
         current_loc = copy.copy(first_loc)
         for loc in next_locations:
-            cost += dist_mat[current_loc, loc] + dist_mat[loc, loc]
+            cost += self.dist_mat[current_loc, loc] + self.dist_mat[loc, loc]
             current_loc = loc
 
-        return (
+        score = (
             dist((0, 0), self.orders.iloc[first_loc, 1])
             + cost
             + dist(self.orders.iloc[current_loc, 2], (0, 0))
         )
+
+        return score if score < 60*12 else np.inf
 
     def find_orders(self, scores: list, tracks: list) -> list:
         """find_orders finds the best orders with minimal scores
@@ -113,10 +125,11 @@ class VRP:
         """
 
         seen_orders, final_tracks = np.array([]), []
-        best_scores = np.array(scores).argsort()
+        normalized_scores = [self.normalized_scores(s, t) for s, t in zip(scores, tracks)]
+        best_scores = np.array(normalized_scores).argsort()
 
         for idx in best_scores:
-            if scores[idx] > 720:
+            if scores[idx] > 12*60:
                 break
 
             track = (
@@ -134,3 +147,20 @@ class VRP:
             final_tracks.append([x])
 
         return final_tracks
+    
+    def normalized_scores(self, score, track):
+        """normalized_scores reduces scores that have multiple points with large distances from the origin
+        :param scores: float score
+        :param track: list of places visited
+        :return: new float score
+        """
+        if score == np.inf: return score
+        
+        distance = 0
+        for place in track:
+            distance += max(
+                dist(self.orders['pickup'][place], (0,0)), 
+                dist(self.orders['dropoff'][place], (0,0))
+                )
+        
+        return score / distance
